@@ -21,17 +21,29 @@ pub mod vault {
         ctx.accounts.withdraw(amount)?;
         Ok(())
     }
+
+    pub fn close_vault(ctx: Context<CloseVault>) -> Result<()> {
+        ctx.accounts.close_vault()?;
+        Ok(())
+    }    
+    
 }
 
+
+/// Initailize Context
 #[derive(Accounts)]
 pub struct Initialize<'info> {
     #[account(mut)]
     pub signer: Signer<'info>,
+
+    /// Vault PDA - a system account that stores SOL
     #[account(
         seeds = [b"vault", vault_state.key().as_ref()],
         bump,
     )]
     pub vault: SystemAccount<'info>,
+
+    /// Vault State PDA - stores metadata (bumps)
     #[account(
         init,
         payer = signer,
@@ -52,6 +64,7 @@ impl<'info> Initialize<'info> {
 }
 
 
+/// Deposit Logic
 #[derive(Accounts)]
 pub struct Deposit<'info> {
     #[account(mut)]
@@ -86,6 +99,7 @@ impl<'info> Deposit<'info> {
 }
 
 
+/// Withdraw Logic
 #[derive(Accounts)]
 pub struct Withdraw<'info> {
     #[account(mut)]
@@ -105,6 +119,22 @@ pub struct Withdraw<'info> {
 
 impl<'info> Withdraw<'info> {
     fn withdraw(&mut self, amount: u64) -> Result<()> {
+
+        // Get the rent exemption minimum for the vault account
+        let rent_exempt_minimum = Rent::get()?.minimum_balance(0);
+
+
+        // Check that the vault has enough funds to withdraw
+        require!(
+            self.vault.lamports() >= amount,
+            VaultError::InsufficientFunds
+        );
+
+        // Check that after withdrawal, the vault will still have rent-exempt balance
+        require!(
+            self.vault.lamports() - amount >= rent_exempt_minimum,
+            VaultError::InsufficientRentExemptBalance,
+        );
 
         let cpi_program = self.system_program.to_account_info();
         let cpi_accounts = Transfer{
@@ -126,14 +156,70 @@ impl<'info> Withdraw<'info> {
     }
 }
 
-// Challenges:
-    // check that the withdraw leaves vault with rent-exempt balance
-    // check the account has enough funds to withdraw
-    // implement a context to close the account
-    // Tip: look for a close context
-    // Don't forget to manually close the vault accont [how do you do that?]
-    // Don't the Deposit and Withdraw have the same accont? can't we just use the same context in different instructions?
 
+/// Close Vault Context
+#[derive(Accounts)]
+pub struct CloseVault<'info> {
+    #[account(mut)]
+    pub signer: Signer<'info>,
+
+    /// Vault PDA - will be closed and lamports sent to signer
+    #[account(
+        mut,
+        seeds = [b"vault", vault_state.key().as_ref()],
+        bump = vault_state.vault_bump,
+    )]
+    pub vault: SystemAccount<'info>,
+
+    /// Vault State PDA - Will be closed
+    #[account(
+        mut,
+        seeds = [b"state", signer.key().as_ref()],
+        bump = vault_state.state_bump,
+        close = signer,
+    )]
+    pub vault_state: Account<'info, VaultState>,
+
+    pub system_program: Program<'info, System>,
+}
+
+impl<'info> CloseVault<'info> {
+    pub fn close_vault(&mut self) -> Result<()> {
+        // Get the current balance of the vault
+        let vault_balance = self.vault.lamports();
+
+        // Only proceed if there's a balance to transfer
+        if vault_balance > 0 {
+            // Transfer all lamports from vault to signer
+            let cpi_program = self.system_program.to_account_info();
+            let cpi_accounts = Transfer{
+                from: self.vault.to_account_info(),
+                to: self.signer.to_account_info()
+            };
+
+            let seeds = &[
+                b"vault".as_ref(),
+                self.vault_state.to_account_info().key.as_ref(),
+                &[self.vault_state.vault_bump],
+            ];
+
+            let signer_seeds = &[&seeds[..]];
+            
+            let cpi_context = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
+            transfer(cpi_context, vault_balance)?;
+        }
+
+        // Manually close the vault account by setting its lamports to 0
+        // and clearing its data
+        **self.vault.to_account_info().try_borrow_mut_lamports()? = 0;
+
+        Ok(())
+    }
+}
+
+
+
+/// Vault State Data
 #[account]
 pub struct VaultState {
     pub vault_bump: u8,
@@ -142,4 +228,14 @@ pub struct VaultState {
 
 impl Space for VaultState {
     const INIT_SPACE: usize = 8 + 1 + 1;
+}
+
+
+/// Custom Error Messages
+#[error_code]
+pub enum VaultError {
+    #[msg("Insufficient funds for the withdrawal")]
+    InsufficientFunds,
+    #[msg("Withdrawal would leave vault below rent-exempt balance")]
+    InsufficientRentExemptBalance,
 }
